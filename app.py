@@ -1,103 +1,137 @@
-import streamlit as st
-import numpy as np
-import pickle
-import gdown
+from __future__ import annotations
+
 import os
-from PIL import Image
-import tensorflow as tf
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.applications.inception_v3 import InceptionV3, preprocess_input
+import tempfile
 
-st.set_page_config(page_title="AI Image Captioning")
-st.title("🧠 AI Powered Image Captioning")
+import matplotlib.pyplot as plt
+import streamlit as st
 
-# 🔴 PASTE YOUR IDs HERE
-MODEL_ID = "15G3juZhDZHnRJFQR2T1jUrTNG7keU4dZ"
-TOKENIZER_ID = "1Q8M-NdPc2q7jIPD0kfqUMjB0zR6rKVXe"
+from compression_lib import ensure_directories, run_compression_pipeline
+from metrics import evaluate_metrics
 
-# ---------------- LOAD EVERYTHING ----------------
-@st.cache_resource
-def load_all():
-    model_path = "caption_model.h5"
-    tokenizer_path = "tokenizer.pkl"
 
-    # Download model
-    if not os.path.exists(model_path):
-        gdown.download(f"https://drive.google.com/uc?id={MODEL_ID}", model_path, quiet=False)
+st.set_page_config(
+    page_title="Medical Image Compression System",
+    layout="wide",
+)
 
-    # Download tokenizer
-    if not os.path.exists(tokenizer_path):
-        gdown.download(f"https://drive.google.com/uc?id={TOKENIZER_ID}", tokenizer_path, quiet=False)
 
-    # Load model
-    model = load_model(model_path)
+def create_metric_table(results: dict) -> list[dict]:
+    table = []
+    for method_name, result in results.items():
+        metric_values = evaluate_metrics(
+            original=result.original_image,
+            reconstructed=result.reconstructed_image,
+            compressed_payload=result.compressed_payload,
+        )
+        table.append(
+            {
+                "Method": method_name,
+                "Compression Ratio": round(metric_values["compression_ratio"], 4),
+                "MSE": round(metric_values["mse"], 4),
+                "PSNR": round(metric_values["psnr"], 4) if metric_values["psnr"] != float("inf") else "inf",
+                "SSIM": round(metric_values["ssim"], 4),
+            }
+        )
+    return table
 
-    # Load tokenizer
-    with open(tokenizer_path, "rb") as f:
-        tokenizer = pickle.load(f)
 
-    # Load CNN (InceptionV3)
-    base_model = InceptionV3(weights="imagenet")
-    cnn_model = tf.keras.Model(
-        inputs=base_model.input,
-        outputs=base_model.layers[-2].output
+def plot_images(results: dict) -> None:
+    for method_name, result in results.items():
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader(f"Original - {method_name}")
+            # Convert grayscale to RGB for proper display
+            original_rgb = np.stack([result.original_image] * 3, axis=-1) if result.original_image.ndim == 2 else result.original_image
+            st.image(original_rgb, use_container_width=True)
+        with col2:
+            st.subheader(f"Reconstructed - {method_name}")
+            # Convert grayscale to RGB for proper display
+            reconstructed_rgb = np.stack([result.reconstructed_image] * 3, axis=-1) if result.reconstructed_image.ndim == 2 else result.reconstructed_image
+            st.image(reconstructed_rgb
+            st.subheader(f"Reconstructed - {method_name}")
+            # Convert grayscale to RGB for proper display
+            reconstructed_rgb = np.stack([result.reconstructed_image] * 3, axis=-1) if result.reconstructed_image.ndim == 2 else result.reconstructed_image
+            st.image(reconstructed_rgb, use_container_width=True)
+
+        fig, ax = plt.subplots(figsize=(7, 3))
+        ax.hist(result.original_image.ravel(), bins=32, alpha=0.5, label="Original")
+        ax.hist(result.reconstructed_image.ravel(), bins=32, alpha=0.5, label="Reconstructed")
+        ax.set_title(f"Histogram Comparison - {method_name}")
+        ax.legend()
+        st.pyplot(fig)
+
+
+def main() -> None:
+    ensure_directories()
+
+    st.title("Medical Image Compression System")
+    st.write(
+        "Compress X-ray, MRI, CT, or DICOM images using wavelet-based and JPEG-LS-inspired methods, "
+        "then compare distortion metrics."
     )
 
-    return model, tokenizer, cnn_model
+    uploaded_file = st.file_uploader("Upload a medical image", type=["png", "jpg", "jpeg", "dcm"])
 
-model, tokenizer, cnn_model = load_all()
+    method = st.selectbox("Select compression method", ["both", "wavelet", "jpegls"])
+    resize_enabled = st.checkbox("Resize image before compression", value=False)
 
-# 🔴 CHANGE if your value is different
-max_length = 34
+    width = st.number_input("Resize width", min_value=64, max_value=2048, value=512, step=32)
+    height = st.number_input("Resize height", min_value=64, max_value=2048, value=512, step=32)
 
-# ---------------- FEATURE EXTRACTION ----------------
-def extract_features(image):
-    image = image.resize((299, 299))
-    image = np.array(image)
-    image = np.expand_dims(image, axis=0)
-    image = preprocess_input(image)
-    feature = cnn_model.predict(image, verbose=0)
-    return feature
+    st.markdown("### Wavelet Parameters")
+    wavelet = st.selectbox("Wavelet family", ["haar", "db1", "db2", "coif1", "sym2"], index=0)
+    level = st.slider("Wavelet decomposition level", min_value=1, max_value=4, value=2)
+    threshold = st.slider("Wavelet threshold ratio", min_value=0.01, max_value=0.50, value=0.08, step=0.01)
 
-# ---------------- WORD MAPPING ----------------
-def word_for_id(integer, tokenizer):
-    for word, index in tokenizer.word_index.items():
-        if index == integer:
-            return word
-    return None
+    st.markdown("### JPEG-LS-Inspired Parameters")
+    near = st.slider("Near-lossless value", min_value=0, max_value=10, value=0, step=1)
 
-# ---------------- CAPTION GENERATION ----------------
-def generate_caption(model, tokenizer, photo, max_length):
-    in_text = "startseq"
+    if st.button("Compress and Analyze", type="primary"):
+        if uploaded_file is None:
+            st.warning("Please upload an image first.")
+            return
 
-    for _ in range(max_length):
-        sequence = tokenizer.texts_to_sequences([in_text])[0]
-        sequence = pad_sequences([sequence], maxlen=max_length)
+        suffix = os.path.splitext(uploaded_file.name)[1] or ".png"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_file.write(uploaded_file.read())
+            temp_path = temp_file.name
 
-        yhat = model.predict([photo, sequence], verbose=0)
-        yhat = np.argmax(yhat)
+        resize_to = (int(width), int(height)) if resize_enabled else None
 
-        word = word_for_id(yhat, tokenizer)
-        if word is None:
-            break
+        results = run_compression_pipeline(
+            image_path=temp_path,
+            method=method,
+            resize_to=resize_to,
+            wavelet=wavelet,
+            level=int(level),
+            threshold_ratio=float(threshold),
+            near=int(near),
+        )
 
-        in_text += " " + word
+        st.success("Compression completed successfully.")
+        st.dataframe(create_metric_table(results), use_container_width=True)
+        plot_images(results)
 
-        if word == "endseq":
-            break
+        comparison_note = []
+        for method_name, result in results.items():
+            metric_values = evaluate_metrics(
+                original=result.original_image,
+                reconstructed=result.reconstructed_image,
+                compressed_payload=result.compressed_payload,
+            )
+            comparison_note.append(
+                f"{method_name}: CR={metric_values['compression_ratio']:.3f}, "
+                f"PSNR={metric_values['psnr']:.3f}, SSIM={metric_values['ssim']:.3f}"
+            )
 
-    return in_text.replace("startseq", "").replace("endseq", "").strip()
+        st.markdown("### Interpretation")
+        st.write(
+            "Higher compression ratio means stronger size reduction. Higher PSNR and SSIM mean better quality. "
+            "Try changing threshold and near-lossless values to observe the trade-off."
+        )
+        st.write(" | ".join(comparison_note))
 
-# ---------------- UI ----------------
-uploaded_file = st.file_uploader("Upload an image", type=["jpg", "png", "jpeg"])
 
-if uploaded_file:
-    image = Image.open(uploaded_file)
-    st.image(image, caption="Uploaded Image", use_container_width=True)
-
-    with st.spinner("Generating caption..."):
-        features = extract_features(image)
-        caption = generate_caption(model, tokenizer, features, max_length)
-
-    st.success(caption)
+if __name__ == "__main__":
+    main()
